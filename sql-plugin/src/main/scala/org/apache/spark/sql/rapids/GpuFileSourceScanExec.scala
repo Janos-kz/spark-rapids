@@ -331,6 +331,7 @@ case class GpuFileSourceScanExec(
    * at a time.
    */
   lazy val inputRDD: RDD[InternalRow] = {
+    System.err.println("!!!GDS_INPUT_RDD!!! inputRDD accessed, isPerFileRead=" + isPerFileReadEnabled.toString)
     val readFile: Option[(PartitionedFile) => Iterator[InternalRow]] =
       if (isPerFileReadEnabled) {
         val reader = gpuFormat.buildReaderWithPartitionValuesAndMetrics(
@@ -572,6 +573,7 @@ case class GpuFileSourceScanExec(
   private def getFinalRDD(
       readFile: Option[(PartitionedFile) => Iterator[InternalRow]],
       partitions: Seq[FilePartition]): RDD[InternalRow] = {
+    System.err.println("!!!GDS_GET_FINAL_RDD!!! Entered getFinalRDD, isPerFileRead=" + isPerFileReadEnabled.toString)
 
     // Prune the partition values for each partition
     val prunedPartitions = requiredPartitionSchema.map { partSchema =>
@@ -609,7 +611,7 @@ case class GpuFileSourceScanExec(
       logDebug(s"Using Datasource RDD, files are: " +
         s"${prunedPartitions.flatMap(FilePartitionShims.getFiles).mkString(",")}")
       // note we use the v2 DataSourceRDD instead of FileScanRDD so we don't have to copy more code
-      GpuDataSourceRDD(relation.sparkSession.sparkContext, locatedPartitions, readerFactory)
+      val rdd = GpuDataSourceRDD(relation.sparkSession.sparkContext, locatedPartitions, readerFactory); System.err.println("!!!GDS_RDD_CREATED!!! RDD type=" + rdd.getClass.getName); rdd
     }
   }
 

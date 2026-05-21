@@ -358,6 +358,7 @@ abstract class MultiFilePartitionReaderFactoryBase(
   protected def getFileFormatShortName: String
 
   override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
+    System.err.println("!!!GDS_READER!!! createColumnarReader called!!!")
     assert(partition.isInstanceOf[FilePartition])
     val filePartition = partition.asInstanceOf[FilePartition]
     val files = SparkShimImpl.getPartitionFiles(filePartition).toArray

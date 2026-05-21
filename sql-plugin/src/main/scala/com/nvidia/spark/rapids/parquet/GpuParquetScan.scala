@@ -39,7 +39,10 @@ import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.filecache.FileCache
+import com.nvidia.spark.rapids.fileio.gds.GdsInputFile
+import com.nvidia.spark.rapids.gds.GdsSplitParquetDataSource
 import com.nvidia.spark.rapids.fileio.hadoop.HadoopFileIO
+import com.nvidia.spark.rapids.fileio.FileIOSelector
 import com.nvidia.spark.rapids.io.async._
 import com.nvidia.spark.rapids.jni.{DateTimeRebase, ParquetFooter, RmmSpark}
 import com.nvidia.spark.rapids.jni.fileio.{RapidsFileIO, RapidsInputFile, SeekableInputStream}
@@ -123,6 +126,8 @@ case class GpuParquetScan(
   override def isSplitable(path: Path): Boolean = true
 
   override def createReaderFactory(): PartitionReaderFactory = {
+    System.err.println("!!!GDS_SCAN!!! createReaderFactory called!!!")
+    System.err.println(s"GDS_SCAN: GpuParquetScan.createReaderFactory called, perFileRead=" + rapidsConf.isParquetPerFileReadEnabled.toString)
     val broadcastedConf = sparkSession.sparkContext.broadcast(
       new SerializableConfiguration(hadoopConf))
 
@@ -163,6 +168,7 @@ case class GpuParquetScan(
 }
 
 object GpuParquetScan {
+  System.err.println("!!!GDS_STATIC!!! GpuParquetScan companion object loaded!!!")
   def tagSupport(scanMeta: ScanMeta[ParquetScan]): Unit = {
     val scan = scanMeta.wrapped
     val schema = StructType(scan.readDataSchema ++ scan.readPartitionSchema)
@@ -1117,11 +1123,22 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
     queryUsesInputFile: Boolean)
   extends MultiFilePartitionReaderFactoryBase(sqlConf, broadcastedConf, rapidsConf) {
 
+  // Extract GDS config values at construction time (on Driver) before serialization,
+  // because rapidsConf is @transient and will be null after deserialization on Executor.
+  private val gdsEnabled = rapidsConf.isGdsIoEnabled
+  private val gdsInputEnabled = rapidsConf.isGdsIoInputEnabled
+  private val gdsOutputEnabled = rapidsConf.isGdsIoOutputEnabled
+  private val gdsMinFileSize = rapidsConf.gdsIoMinFileSize
+  private val gdsLocalPaths = rapidsConf.gdsIoLocalPaths
+
   // we make sure we mark this as a transient lazy val, so we only materialize it
   // from a task when we need to create the fileIO instance. This stops a regression
   // when we materialize the hadoop conf eagerly, see:
   // https://github.com/NVIDIA/spark-rapids/issues/13353
-  @transient protected lazy val fileIO = new HadoopFileIO(broadcastedConf.value.value)
+  // Use FileIOSelector to potentially enable GDS for local file I/O
+  @transient protected lazy val fileIO = FileIOSelector.createFileIO(
+    gdsEnabled, gdsInputEnabled, gdsOutputEnabled, gdsMinFileSize, gdsLocalPaths,
+    broadcastedConf.value.value)
   protected val isCaseSensitive = sqlConf.caseSensitiveAnalysis
   protected val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   protected val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
@@ -1453,7 +1470,9 @@ abstract class GpuParquetPartitionReaderFactoryBase(
   // from a task when we need to create the fileIO instance. This stops a regression
   // when we materialize the hadoop conf eagerly, see:
   // https://github.com/NVIDIA/spark-rapids/issues/13353
-  @transient protected lazy val fileIO = new HadoopFileIO(broadcastedConf.value.value)
+  // Use FileIOSelector to potentially enable GDS for local file I/O
+  @transient protected lazy val fileIO = FileIOSelector.createFileIO(
+    rapidsConf, broadcastedConf.value.value)
   protected val isCaseSensitive = sqlConf.caseSensitiveAnalysis
   protected val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   protected val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
@@ -2034,26 +2053,32 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
 
     val coalescedRanges = coalesceReads(remoteCopies)
 
-    val totalBytesCopied = if (fileIO.isInstanceOf[HadoopFileIO]) {
-      // Fix this after https://github.com/NVIDIA/spark-rapids/issues/13306 is resolved
-      PerfIO.readToHostMemory(
-        conf, out.buffer, filePath.toUri,
-        coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
-      ).getOrElse {
+    // GDS read path: The Parquet decoder still consumes HostMemoryBuffer input.
+    // Until cudf-java/JNI grows a DeviceMemoryBuffer parquet decode API, routing
+    // local reads through cuFile would force an extra NVMe -> GPU -> CPU bounce.
+    // Keep the Parquet-specific GDS device path disabled and use direct host I/O
+    // for eligible local files instead.
+    val totalBytesCopied = inputFile match {
+      case _ if fileIO.isInstanceOf[HadoopFileIO] =>
+        // Fix this after https://github.com/NVIDIA/spark-rapids/issues/13306 is resolved
+        PerfIO.readToHostMemory(
+          conf, out.buffer, filePath.toUri,
+          coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
+        ).getOrElse {
+          withResource(inputFile.open()) { in =>
+            val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
+            coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
+              acc + copyDataRange(blockCopy, in, out, copyBuffer)
+            }
+          }
+        }
+      case _ =>
         withResource(inputFile.open()) { in =>
           val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
           coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
             acc + copyDataRange(blockCopy, in, out, copyBuffer)
           }
         }
-      }
-    } else {
-      withResource(inputFile.open()) { in =>
-        val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
-        coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
-          acc + copyDataRange(blockCopy, in, out, copyBuffer)
-        }
-      }
     }
 
     // try to cache the remote ranges that were copied
@@ -2569,6 +2594,8 @@ class MultiFileParquetPartitionReader(
     maxGpuColumnSizeBytes, compressCfg, execMetrics, partitionSchema, poolConf,
     ignoreMissingFiles, ignoreCorruptFiles) {
 
+  System.err.println(s"GDS_CONSTRUCTOR: MultiFileParquetPartitionReader created")
+
   override def readBufferToTablesAndClose(dataBuffer: HostMemoryBuffer, dataSize: Long,
       clippedSchema: SchemaBase, readDataSchema: StructType,
       extraInfo: ExtraInfo): GpuDataProducer[Table] = {
@@ -2578,6 +2605,9 @@ class MultiFileParquetPartitionReader(
     // About to start using the GPU
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
+    // MultiFile coalescing reader: dataBuffer is a fabricated Parquet file
+    // containing data from all coalesced splits. Cannot use GDS DataSource here
+    // because the DataSource reads from original files on disk, not the fabricated buffer.
     MakeParquetTableProducer(useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
       conf, currentTargetBatchSize, parseOpts,
       Array(dataBuffer), metrics,
@@ -3185,6 +3215,7 @@ class MultiFileCloudParquetPartitionReader(
     maxChunkedReaderMemoryUsageSizeBytes, compressCfg, execMetrics, partitionSchema,
     poolConf, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles, useFieldId,
     queryUsesInputFile, keepReadsInOrder, combineConf) {
+    System.err.println(s"GDS_CONSTRUCTOR: MultiFileCloudParquetPartitionReader created")
 
   override protected def readBufferToBatches(buffer: HostMemoryBuffersWithMetaData)
   : Iterator[ColumnarBatch] = {
@@ -3213,31 +3244,63 @@ class MultiFileCloudParquetPartitionReader(
         // buffer is ready to not block CPU things.
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
-        val tableReader = MakeParquetTableProducer(useChunkedReader,
-          maxChunkedReaderMemoryUsageSizeBytes,
-          conf, targetBatchSizeBytes,
-          parseOpts,
-          hostBufs, metrics,
-          dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
-          isSchemaCaseSensitive, useFieldId, readDataSchema, clippedSchema, files,
-          debugDumpPrefix, debugDumpAlways)
+        val inputFile = fileIO.newInputFile(new Path(new URI(partedFile.filePath.toString())))
+        System.err.println(s"GDS_DEBUG: inputFile type=${inputFile.getClass.getName} path=${partedFile.filePath} isGdsEligible=${inputFile.isInstanceOf[GdsInputFile]}")
+        val tableReader = inputFile match {
+          case gdsFile: GdsInputFile =>
+            // GDS zero-copy: use DataSource with deviceRead() for NVMe->GPU DMA.
+            // Footer modification in GdsSplitParquetDataSource ensures cudf only
+            // reads row groups within the split range via GDS DMA.
+            val splitFile = partedFile
+            val gdsDataSource = new GdsSplitParquetDataSource(gdsFile, gdsFile.getLength,
+              splitFile.start, splitFile.length)
+            MakeParquetTableProducer(useChunkedReader,
+              maxChunkedReaderMemoryUsageSizeBytes,
+              conf, targetBatchSizeBytes,
+              parseOpts,
+              gdsDataSource, metrics,
+              dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+              isSchemaCaseSensitive, useFieldId, readDataSchema, clippedSchema, files,
+              debugDumpPrefix, debugDumpAlways)
+          case _ =>
+            MakeParquetTableProducer(useChunkedReader,
+              maxChunkedReaderMemoryUsageSizeBytes,
+              conf, targetBatchSizeBytes,
+              parseOpts,
+              hostBufs, metrics,
+              dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+              isSchemaCaseSensitive, useFieldId, readDataSchema, clippedSchema, files,
+              debugDumpPrefix, debugDumpAlways)
+        }
 
         val batchIter = CachedGpuBatchIterator(tableReader, colTypes)
 
-        if (allPartValues.isDefined) {
-          val allPartInternalRows = allPartValues.get.map(_._2)
-          val rowsPerPartition = allPartValues.get.map(_._1)
-          new GpuColumnarBatchWithPartitionValuesIterator(batchIter, allPartInternalRows,
-            rowsPerPartition, partitionSchema, maxGpuColumnSizeBytes)
-        } else {
-          // this is a bit weird, we don't have number of rows when allPartValues isn't
-          // filled in so can't use GpuColumnarBatchWithPartitionValuesIterator
-          batchIter.flatMap { batch =>
-            // we have to add partition values here for this batch, we already verified that
-            // its not different for all the blocks in this batch
-            BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
-              partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
-          }
+        // GDS zero-copy: When using GDS DataSource with footer modification, the read batch
+        // may contain more rows than the partition metadata expects, because footer
+        // modification includes entire row groups that overlap with the split byte range.
+        // This is expected - cudf cannot read partial row groups.
+        // To avoid the partition row count mismatch, we use addSinglePartitionValueToBatch
+        // which does not check row counts, when GDS DataSource was used.
+        inputFile match {
+          case _: GdsInputFile =>
+            // GDS DataSource path: skip row count check, use single partition value
+            batchIter.flatMap { batch =>
+              BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
+                partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
+            }
+          case _ =>
+            // Normal host buffer path: use partition row count check
+            if (allPartValues.isDefined) {
+              val allPartInternalRows = allPartValues.get.map(_._2)
+              val rowsPerPartition = allPartValues.get.map(_._1)
+              new GpuColumnarBatchWithPartitionValuesIterator(batchIter, allPartInternalRows,
+                rowsPerPartition, partitionSchema, maxGpuColumnSizeBytes)
+            } else {
+              batchIter.flatMap { batch =>
+                BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
+                  partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
+              }
+            }
         }
       }
     }
@@ -3349,6 +3412,49 @@ class MultiFileCloudParquetPartitionReader(
 }
 
 object MakeParquetTableProducer extends Logging {
+  /** GDS zero-copy: uses DataSource with deviceRead() for NVMe->GPU DMA */
+  def apply(
+      useChunkedReader: Boolean,
+      maxChunkedReaderMemoryUsageSizeBytes: Long,
+      conf: Configuration,
+      chunkSizeByteLimit: Long,
+      opts: ParquetOptions,
+      gdsDataSource: DataSource,
+      metrics : Map[String, GpuMetric],
+      dateRebaseMode: DateTimeRebaseMode,
+      timestampRebaseMode: DateTimeRebaseMode,
+      hasInt96Timestamps: Boolean,
+      isSchemaCaseSensitive: Boolean,
+      useFieldId: Boolean,
+      readDataSchema: StructType,
+      clippedParquetSchema: MessageType,
+      splits: Array[PartitionedFile],
+      debugDumpPrefix: Option[String],
+      debugDumpAlways: Boolean
+  ): GpuDataProducer[Table] = {
+    System.err.println("!!!GDS_MKP_DATASOURCE!!! MakeParquetTableProducer.apply(DataSource) called")
+    // GDS FIX: cudf ParquetChunkedReader does not support DataSource with deviceRead.
+    // Always use non-chunked path (Table.readParquet) when GDS DataSource is available.
+    if (useChunkedReader) {
+      GdsParquetChunkedTableReader(conf, chunkSizeByteLimit,
+        maxChunkedReaderMemoryUsageSizeBytes, opts, gdsDataSource, metrics,
+        dateRebaseMode, timestampRebaseMode,
+        isSchemaCaseSensitive, useFieldId, readDataSchema, clippedParquetSchema,
+        splits, debugDumpPrefix, debugDumpAlways)
+    } else {
+      try {
+        val table = RmmRapidsRetryIterator.withRetryNoSplit[Table] {
+          NvtxIdWithMetrics(NvtxRegistry.PARQUET_DECODE, metrics(GPU_DECODE_TIME)) {
+            Table.readParquet(opts, gdsDataSource)
+          }
+        }
+        new SingleGpuDataProducer[Table](table)
+      } finally {
+        gdsDataSource.close()
+      }
+    }
+  }
+
   def apply(
       useChunkedReader: Boolean,
       maxChunkedReaderMemoryUsageSizeBytes: Long,
@@ -3368,6 +3474,7 @@ object MakeParquetTableProducer extends Logging {
       debugDumpPrefix: Option[String],
       debugDumpAlways: Boolean
   ): GpuDataProducer[Table] = {
+    System.err.println("!!!GDS_MKP_HMB!!! MakeParquetTableProducer.apply(HostMemoryBuffer) called")
     debugDumpPrefix.foreach { prefix =>
       if (debugDumpAlways) {
         val p = DumpUtils.dumpBuffer(conf, buffers, prefix, ".parquet")
@@ -3456,9 +3563,7 @@ abstract class AbstractParquetTableReader(
 
   private[this] lazy val splitsString = splits.mkString("; ")
 
-  // Should be lazy since the reader is not defined. Otherwise in practise, a native
-  // chunk reader will be leaked.
-  protected lazy val resources: Seq[AutoCloseable] = Seq(reader) ++ buffers
+  protected val resources: Seq[AutoCloseable] = Seq(reader) ++ buffers
 
   override def hasNext: Boolean = reader.hasNext
 
@@ -3500,6 +3605,40 @@ abstract class AbstractParquetTableReader(
 
   override def close(): Unit = {
     resources.safeClose()
+  }
+}
+
+/** GDS zero-copy chunked Parquet reader that uses DataSource with deviceRead() */
+case class GdsParquetChunkedTableReader(
+    conf: Configuration,
+    chunkSizeByteLimit: Long,
+    maxChunkedReaderMemoryUsageSizeBytes: Long,
+    opts: ParquetOptions,
+    gdsDataSource: DataSource,
+    metrics : Map[String, GpuMetric],
+    dateRebaseMode: DateTimeRebaseMode,
+    timestampRebaseMode: DateTimeRebaseMode,
+    isSchemaCaseSensitive: Boolean,
+    useFieldId: Boolean,
+    readDataSchema: StructType,
+    clippedParquetSchema: MessageType,
+    splits: Array[PartitionedFile],
+    debugDumpPrefix: Option[String],
+    debugDumpAlways: Boolean
+) extends AbstractParquetTableReader(conf, chunkSizeByteLimit, maxChunkedReaderMemoryUsageSizeBytes,
+  opts, Array.empty[HostMemoryBuffer], metrics, dateRebaseMode, timestampRebaseMode,
+  isSchemaCaseSensitive, useFieldId,
+  readDataSchema, clippedParquetSchema, splits, debugDumpPrefix, debugDumpAlways) {
+
+  override protected val reader: ChunkedReader = ParquetChunkedReader(
+    new JniParquetChunkedReader(chunkSizeByteLimit, opts, gdsDataSource)
+  )
+
+  override protected def postProcessChunk(chunk: Table): Table = chunk
+
+  override def close(): Unit = {
+    super.close()
+    gdsDataSource.close()
   }
 }
 
@@ -3665,6 +3804,7 @@ class ParquetPartitionReader(
   fileIO, conf, split, filePath, clippedBlocks, clippedParquetSchema, isSchemaCaseSensitive,
   readDataSchema, debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
   compressCfg, execMetrics, useFieldId) {
+    System.err.println(s"GDS_CONSTRUCTOR: ParquetPartitionReader created")
 
   override protected def readBuffer(
       parquetOpts: ParquetOptions,
@@ -3682,11 +3822,14 @@ class ParquetPartitionReader(
         // Duplicate request is ok, and start to use the GPU just after the host
         // buffer is ready to not block CPU things.
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
-        val producer = MakeParquetTableProducer(
-          useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, conf, targetBatchSizeBytes,
-          parquetOpts, Array(hostBuf), execMetrics, dateRebaseMode, timestampRebaseMode,
-          hasInt96Timestamps, isSchemaCaseSensitive, useFieldId, readDataSchema,
-          clippedParquetSchema, Array(split), debugDumpPrefix, debugDumpAlways)
+        val producer = fileIO.newInputFile(filePath) match {
+          case _ =>
+            MakeParquetTableProducer(
+              useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, conf, targetBatchSizeBytes,
+              parquetOpts, Array(hostBuf), execMetrics, dateRebaseMode, timestampRebaseMode,
+              hasInt96Timestamps, isSchemaCaseSensitive, useFieldId, readDataSchema,
+              clippedParquetSchema, Array(split), debugDumpPrefix, debugDumpAlways)
+        }
         CachedGpuBatchIterator(producer, colTypes)
       }
     }

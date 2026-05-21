@@ -97,7 +97,8 @@ class GpuDataSourceRDD(
 
           // TODO: SPARK-25083 remove the type erasure hack in data source scan
           val (iter, reader) = {
-            val batchReader = partitionReaderFactory.createColumnarReader(inputPartition)
+            System.err.println("!!!GDS_DATASOURCE_RDD!!! createColumnarReader called, factory type=" + partitionReaderFactory.getClass.getName);
+          val batchReader = partitionReaderFactory.createColumnarReader(inputPartition)
             val iter = new MetricsBatchIterator(
               new PartitionIterator[ColumnarBatch](batchReader))
             (iter, batchReader)
